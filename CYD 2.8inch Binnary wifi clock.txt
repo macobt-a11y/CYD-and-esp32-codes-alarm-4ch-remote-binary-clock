@@ -1,0 +1,168 @@
+#include <WiFi.h>
+#include "time.h"
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+
+// --- CONFIG ---
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+const long gmtOffset_sec = 3600; 
+const int daylightOffset_sec = 3600;
+
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+TFT_eSPI tft = TFT_eSPI();
+SPIClass touchSPI = SPIClass(VSPI);
+XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+
+enum Mode { CLOCK_MODE, MENU_MODE };
+Mode currentMode = CLOCK_MODE;
+
+uint16_t hCol = 0xF81F, mCol = 0x07FF, sCol = 0x07E0; 
+uint16_t palette[] = {0xF81F, 0x07FF, 0x07E0, 0xFFE0, 0xF800, 0x001F, 0xFFFF, 0xFDA0, 0xB01F, 0x07EF, 0x780F, 0xBC40};
+int hIdx = 0, mIdx = 1, sIdx = 2;
+
+// --- GLOBAL STATE STORAGE (Fixes 'not declared in scope' error) ---
+int lastBits[6] = {-1, -1, -1, -1, -1, -1}; 
+int lastDay = -1; 
+unsigned long lastWifiUpdate = 0;
+
+void setup() {
+  pinMode(21, OUTPUT); digitalWrite(21, HIGH);
+  tft.init(); tft.setRotation(1);
+  touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin(touchSPI); ts.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextColor(TFT_CYAN);
+  tft.drawCentreString("WIFI_CONNECTING...", 160, 100, 2);
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  
+  configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+  tft.fillScreen(TFT_BLACK);
+}
+
+void drawWifi(int rssi) {
+  int x = 290, y = 10;
+  tft.fillRect(x, 0, 30, 15, TFT_BLACK); 
+  for(int i=0; i<4; i++) {
+    int h = (i + 1) * 3;
+    uint16_t c = (rssi > -90 + (i*10)) ? 0x07FF : 0x4208;
+    tft.fillRect(x + (i*5), y + (12-h), 3, h, c);
+  }
+}
+
+void renderColumn(int val, int colIndex, int x, int bits, uint16_t color) {
+  for (int i = 0; i < bits; i++) {
+    bool on = (val >> i) & 1;
+    bool wasOn = (lastBits[colIndex] >> i) & 1;
+
+    if (on != wasOn || lastBits[colIndex] == -1) {
+      int y = 140 - (i * 40);
+      tft.drawRoundRect(x, y, 32, 32, 4, color);
+      if (on) {
+        tft.fillRoundRect(x+2, y+2, 28, 28, 3, color);
+        tft.setTextColor(TFT_BLACK);
+      } else {
+        tft.fillRect(x+2, y+2, 28, 28, TFT_BLACK);
+        tft.setTextColor(color);
+      }
+      tft.drawCentreString(String(1 << i), x + 16, y + 8, 2);
+    }
+  }
+  lastBits[colIndex] = val; 
+}
+
+void drawMenu() {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawCentreString("COLOR CUSTOMIZATION", 160, 10, 2);
+  
+  auto drawBtn = [](int y, uint16_t c, const char* txt) {
+    tft.fillRoundRect(20, y, 280, 35, 5, c);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawCentreString(txt, 160, y + 10, 2);
+  };
+
+  drawBtn(45, hCol, "HOURS");
+  drawBtn(95, mCol, "MINUTES");
+  drawBtn(145, sCol, "SECONDS");
+
+  tft.drawRoundRect(20, 200, 130, 35, 5, TFT_RED);
+  tft.setTextColor(TFT_RED); tft.drawCentreString("BACK", 85, 210, 2);
+  
+  tft.drawRoundRect(170, 200, 130, 35, 5, 0x07E0);
+  tft.setTextColor(0x07E0); tft.drawCentreString("SAVE", 235, 210, 2);
+}
+
+void loop() {
+  if (currentMode == CLOCK_MODE) {
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) return;
+
+    if (millis() - lastWifiUpdate > 15000) { 
+      drawWifi(WiFi.RSSI()); 
+      lastWifiUpdate = millis(); 
+    }
+
+    renderColumn(timeinfo.tm_hour / 10, 0, 20, 2, hCol);
+    renderColumn(timeinfo.tm_hour % 10, 1, 55, 4, hCol);
+    renderColumn(timeinfo.tm_min / 10, 2, 110, 3, mCol);
+    renderColumn(timeinfo.tm_min % 10, 3, 145, 4, mCol);
+    renderColumn(timeinfo.tm_sec / 10, 4, 200, 3, sCol);
+    renderColumn(timeinfo.tm_sec % 10, 5, 235, 4, sCol);
+
+    if (timeinfo.tm_mday != lastDay) {
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      char dateBuf[20];
+      sprintf(dateBuf, "%02d/%02d/%04d", timeinfo.tm_mday, timeinfo.tm_mon + 1, timeinfo.tm_year + 1900);
+      tft.drawCentreString(dateBuf, 190, 215, 2);
+      
+      tft.setTextColor(hCol); tft.drawCentreString("H", 37, 180, 1);
+      tft.setTextColor(mCol); tft.drawCentreString("M", 127, 180, 1);
+      tft.setTextColor(sCol); tft.drawCentreString("S", 217, 180, 1);
+      lastDay = timeinfo.tm_mday;
+    }
+
+    tft.drawRoundRect(5, 210, 60, 25, 4, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("MENU", 35, 215, 1);
+
+    if (ts.touched()) {
+      TS_Point p = ts.getPoint();
+      int tx = map(p.x, 200, 3700, 0, 320);
+      int ty = map(p.y, 240, 3800, 0, 240);
+      if (tx < 70 && ty > 200) { 
+        currentMode = MENU_MODE; 
+        drawMenu(); 
+        delay(300); 
+      }
+    }
+  } 
+  else {
+    if (ts.touched()) {
+      TS_Point p = ts.getPoint();
+      int tx = map(p.x, 200, 3700, 0, 320);
+      int ty = map(p.y, 240, 3800, 0, 240);
+      
+      if (ty > 45 && ty < 80) { hIdx = (hIdx + 1) % 12; hCol = palette[hIdx]; drawMenu(); }
+      if (ty > 95 && ty < 130) { mIdx = (mIdx + 1) % 12; mCol = palette[mIdx]; drawMenu(); }
+      if (ty > 145 && ty < 180) { sIdx = (sIdx + 1) % 12; sCol = palette[sIdx]; drawMenu(); }
+      
+      if (ty > 200) { 
+        currentMode = CLOCK_MODE; 
+        for(int i=0; i<6; i++) lastBits[i] = -1; // Reset bit memory
+        lastDay = -1; // Reset date memory
+        tft.fillScreen(TFT_BLACK); 
+      }
+      delay(300);
+    }
+  }
+}
